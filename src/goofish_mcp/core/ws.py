@@ -1,0 +1,656 @@
+"""闲鱼 IM WebSocket 运行时。
+
+协议：LWP（Long-polling WebSocket Protocol，钉钉体系）——JSON 而非 Protobuf。
+端点：wss://wss-goofish.dingtalk.com/
+
+职责：
+- 连接 + /reg 注册（accessToken 鉴权）
+- 心跳 /!（15s）
+- 下行 ack（code=200 回包，透传 mid/sid/app-key/ua/dt）
+- 上行业务帧：send_msg / list_user_messages / create_chat
+- 收包解密回退（syncPushPackage.data[].data → json 或 decrypt）
+"""
+from __future__ import annotations
+
+import asyncio
+import base64
+import json
+import time
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager, suppress
+from typing import Any
+
+import websockets
+from loguru import logger
+from websockets.asyncio.client import ClientConnection
+
+from goofish_mcp.core.errors import GoofishError
+from goofish_mcp.core.session import Session
+from goofish_mcp.core.sign import decrypt, generate_mid, generate_uuid
+from goofish_mcp.core.token import IM_APP_KEY, get_access_token
+
+WS_URL = "wss://wss-goofish.dingtalk.com/"
+UA_WEB = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
+)
+UA_IM = (
+    UA_WEB
+    + " DingTalk(2.1.5) OS(Windows/10) Browser(Chrome/133.0.0.0) "
+    + "DingWeb/2.1.5 IMPaaS DingWeb/2.1.5"
+)
+
+
+def _cookie_header(session: Session) -> str:
+    return "; ".join(f"{k}={v}" for k, v in session.http.cookies.get_dict().items())
+
+
+def _handshake_headers(session: Session) -> dict[str, str]:
+    return {
+        "Cookie": _cookie_header(session),
+        "Host": "wss-goofish.dingtalk.com",
+        "Connection": "Upgrade",
+        "Pragma": "no-cache",
+        "Cache-Control": "no-cache",
+        "User-Agent": UA_WEB,
+        "Origin": "https://www.goofish.com",
+        "Accept-Encoding": "gzip, deflate, br, zstd",
+        "Accept-Language": "zh-CN,zh;q=0.9",
+    }
+
+
+@asynccontextmanager
+async def connect(session: Session) -> AsyncIterator[ClientConnection]:
+    """建立 WebSocket 连接（未 reg）。外层自己 reg + heartbeat。"""
+    async with websockets.connect(
+        WS_URL,
+        additional_headers=_handshake_headers(session),
+        ping_interval=None,  # 禁用 WS ping，我们走 LWP /! 心跳
+        max_size=4 * 1024 * 1024,
+    ) as ws:
+        yield ws
+
+
+async def register(
+    ws: ClientConnection, session: Session, token: str
+) -> dict[str, str]:
+    """发送 `/reg` + `/r/SyncStatus/ackDiff`，返回两者的 mid 供调用方校验回包。
+
+    发完立即返回：回包由外层 recv 循环消化。校验在 `wait_ready()` 里按返回的
+    mid 进行，而不是放在这里——`register()` 若自己消费回包，会吃掉
+    `list_user_messages()` 赖以触发请求的 `/s/vulcan` 帧。
+
+    因此目前只有走 `wait_ready()` 的发送路径会校验握手；
+    `list_user_messages()` 与 `run_forever()` 仍是忽略返回值的 fire-and-forget。
+    """
+    reg_mid = generate_mid()
+    reg = {
+        "lwp": "/reg",
+        "headers": {
+            "cache-header": "app-key token ua wv",
+            "app-key": IM_APP_KEY,
+            "token": token,
+            "ua": UA_IM,
+            "dt": "j",
+            "wv": "im:3,au:3,sy:6",
+            "sync": "0,0;0;0;",
+            "did": session.device_id,
+            "mid": reg_mid,
+        },
+    }
+    await ws.send(json.dumps(reg))
+    current_ms = int(time.time() * 1000)
+    ack_diff_mid = generate_mid()
+    ack_diff = {
+        "lwp": "/r/SyncStatus/ackDiff",
+        "headers": {"mid": ack_diff_mid},
+        "body": [
+            {
+                "pipeline": "sync",
+                "tooLong2Tag": "PNM,1",
+                "channel": "sync",
+                "topic": "sync",
+                "highPts": 0,
+                "pts": current_ms * 1000,
+                "seq": 0,
+                "timestamp": current_ms,
+            }
+        ],
+    }
+    await ws.send(json.dumps(ack_diff))
+    return {"reg": reg_mid, "ack_diff": ack_diff_mid}
+
+
+async def heartbeat_loop(ws: ClientConnection, interval: float = 15.0) -> None:
+    """LWP /! 空心跳，默认 15s 一次。"""
+    while True:
+        try:
+            await ws.send(json.dumps({"lwp": "/!", "headers": {"mid": generate_mid()}}))
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"heartbeat send failed: {e}")
+            return
+        await asyncio.sleep(interval)
+
+
+def build_ack(msg: dict[str, Any]) -> dict[str, Any]:
+    """对下行包回 code=200 ack，透传关键 header。"""
+    h = msg.get("headers") or {}
+    ack: dict[str, Any] = {
+        "code": 200,
+        "headers": {
+            "mid": h.get("mid") or generate_mid(),
+            "sid": h.get("sid", ""),
+        },
+    }
+    for k in ("app-key", "ua", "dt"):
+        if k in h:
+            ack["headers"][k] = h[k]
+    return ack
+
+
+async def _recv_json(ws: ClientConnection, *, timeout: float) -> dict[str, Any] | None:
+    """收一帧并解析成 dict。超时或非 JSON 返回 None。"""
+    try:
+        raw = await asyncio.wait_for(ws.recv(), timeout=timeout)
+    except TimeoutError:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+async def wait_ready(
+    ws: ClientConnection,
+    *,
+    mids: dict[str, str] | None = None,
+    timeout: float = 15.0,
+) -> bool:
+    """等服务端推 `/s/vulcan`，期间对下行帧回 ack。就绪返回 True。
+
+    `/r/` 请求在 `/s/vulcan` 到达之前发出会被服务端以 `code 400` 拒绝。`/reg`
+    自身返回 200，所以「注册成功」并不代表连接已经可以发请求。
+    `list_user_messages()` 一直是等到 `/s/vulcan` 才发 `/r/` 请求。
+
+    传入 `register()` 返回的 mids 时顺带校验握手回包：
+
+    * `/reg` 非 200 直接抛错 —— 注册失败后继续发送没有意义。
+    * `ackDiff` 非 200 只记警告 —— 实测它恒为 400（与 `pts` 取值无关），而
+      `collect_session_cids()` 用同样的 ackDiff 也拿 400 却工作正常，sync
+      下推照常到达，因此不作为致命错误。
+    """
+    reg_mid = (mids or {}).get("reg")
+    ack_diff_mid = (mids or {}).get("ack_diff")
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while True:
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return False
+        frame = await _recv_json(ws, timeout=min(3.0, remaining))
+        if frame is None:
+            continue
+
+        frame_mid = (frame.get("headers") or {}).get("mid")
+        if reg_mid and frame_mid == reg_mid and frame.get("code") != 200:
+            raise GoofishError(
+                f"IM 注册失败：/reg 返回 code={frame.get('code')}，未发送"
+            )
+        if ack_diff_mid and frame_mid == ack_diff_mid and frame.get("code") != 200:
+            logger.debug("ackDiff rejected with code=%s (non-fatal)", frame.get("code"))
+
+        with suppress(Exception):
+            await ws.send(json.dumps(build_ack(frame)))
+        if frame.get("lwp") == "/s/vulcan":
+            return True
+
+
+async def recv_ack(
+    ws: ClientConnection, mid: str, *, timeout: float = 10.0
+) -> dict[str, Any] | None:
+    """读取 `mid` 对应的响应帧，期间继续对下行推送回 ack。超时返回 None。"""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while True:
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return None
+        frame = await _recv_json(ws, timeout=min(3.0, remaining))
+        if frame is None:
+            continue
+        if (frame.get("headers") or {}).get("mid") == mid:
+            return frame
+        with suppress(Exception):
+            await ws.send(json.dumps(build_ack(frame)))
+
+
+async def send_text(
+    ws: ClientConnection, *, myid: str, cid: str, toid: str, text: str
+) -> str:
+    """发一条文本消息。返回用于追踪的 mid。"""
+    return await _send_custom(ws, myid=myid, cid=cid, toid=toid, ctype=1, payload={
+        "contentType": 1, "text": {"text": text},
+    })
+
+
+async def send_image(
+    ws: ClientConnection,
+    *,
+    myid: str,
+    cid: str,
+    toid: str,
+    url: str,
+    width: int,
+    height: int,
+) -> str:
+    return await _send_custom(ws, myid=myid, cid=cid, toid=toid, ctype=2, payload={
+        "contentType": 2,
+        "image": {"pics": [{"type": 0, "url": url, "width": width, "height": height}]},
+    })
+
+
+async def _send_custom(
+    ws: ClientConnection,
+    *,
+    myid: str,
+    cid: str,
+    toid: str,
+    ctype: int,
+    payload: dict[str, Any],
+) -> str:
+    mid = generate_mid()
+    data_b64 = base64.b64encode(json.dumps(payload).encode("utf-8")).decode("utf-8")
+    msg = {
+        "lwp": "/r/MessageSend/sendByReceiverScope",
+        "headers": {"mid": mid},
+        "body": [
+            {
+                "uuid": generate_uuid(),
+                "cid": f"{cid}@goofish",
+                "conversationType": 1,
+                "content": {
+                    "contentType": 101,
+                    "custom": {"type": ctype, "data": data_b64},
+                },
+                "redPointPolicy": 0,
+                "extension": {"extJson": "{}"},
+                "ctx": {"appVersion": "1.0", "platform": "web"},
+                "mtags": {},
+                "msgReadStatusSetting": 1,
+            },
+            {
+                "actualReceivers": [f"{toid}@goofish", f"{myid}@goofish"],
+            },
+        ],
+    }
+    await ws.send(json.dumps(msg))
+    return mid
+
+
+async def create_chat(ws: ClientConnection, *, myid: str, toid: str, item_id: str) -> str:
+    """创建/复用单聊会话。返回 mid 供回包配对（若需要）。"""
+    mid = generate_mid()
+    msg = {
+        "lwp": "/r/SingleChatConversation/create",
+        "headers": {"mid": mid},
+        "body": [
+            {
+                "pairFirst": f"{toid}@goofish",
+                "pairSecond": f"{myid}@goofish",
+                "bizType": "1",
+                "extension": {"itemId": item_id},
+                "ctx": {"appVersion": "1.0", "platform": "web"},
+            }
+        ],
+    }
+    await ws.send(json.dumps(msg))
+    return mid
+
+
+async def collect_session_cids(session: Session, duration: float = 5.0) -> list[dict[str, Any]]:
+    """连 WS + /reg + ackDiff(pts=0)，收 duration 秒，返回所有 push 到的 session cid。
+
+    涵盖两路：
+    - `/s/vulcan` 里 `operation.sessionInfo`（历史会话激活事件）
+    - `extract_meta_event` 的 `new_msg`（最新未读通知）
+
+    返回会话标识、类型、商品、消息时间通知和 owner/extUser 角色参加者。
+    角色字段不能直接当对端，也不包含昵称和消息正文；调用方结合当前账号与
+    最近消息页确认身份。itemSellerId 与 squadName 不用于对端身份推断。
+    """
+    token = get_access_token(session)
+    acc: dict[str, dict[str, Any]] = {}
+
+    async with connect(session) as ws:
+        reg_mid = generate_mid()
+        reg = {
+            "lwp": "/reg",
+            "headers": {
+                "cache-header": "app-key token ua wv",
+                "app-key": IM_APP_KEY,
+                "token": token,
+                "ua": UA_IM,
+                "dt": "j",
+                "wv": "im:3,au:3,sy:6",
+                "sync": "0,0;0;0;",
+                "did": session.device_id,
+                "mid": reg_mid,
+            },
+        }
+        await ws.send(json.dumps(reg))
+        ack_diff = {
+            "lwp": "/r/SyncStatus/ackDiff",
+            "headers": {"mid": generate_mid()},
+            "body": [
+                {
+                    "pipeline": "sync",
+                    "tooLong2Tag": "PNM,1",
+                    "channel": "sync",
+                    "topic": "sync",
+                    "highPts": 0,
+                    "pts": 0,
+                    "seq": 0,
+                    "timestamp": int(time.time() * 1000),
+                }
+            ],
+        }
+        await ws.send(json.dumps(ack_diff))
+
+        hb = asyncio.create_task(heartbeat_loop(ws))
+        deadline = time.time() + duration
+        try:
+            while time.time() < deadline:
+                try:
+                    raw = await asyncio.wait_for(
+                        ws.recv(), timeout=max(0.1, deadline - time.time())
+                    )
+                except TimeoutError:
+                    break
+                try:
+                    msg = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                if (msg.get("headers") or {}).get("mid") == reg_mid and msg.get("code") != 200:
+                    raise GoofishError(f"IM 会话发现注册失败：code={msg.get('code')}")
+                with suppress(Exception):
+                    await ws.send(json.dumps(build_ack(msg)))
+
+                for decoded in extract_push_messages(msg):
+                    if not isinstance(decoded, dict):
+                        continue
+                    # a) 会话激活事件：{sessionId, chatType, operation:{sessionInfo:{extensions}}}
+                    cid = str(decoded.get("sessionId") or "")
+                    op = decoded.get("operation") or {}
+                    sess_info = op.get("sessionInfo") if isinstance(op, dict) else None
+                    if cid and isinstance(sess_info, dict):
+                        ext = sess_info.get("extensions") or {}
+                        entry = acc.setdefault(cid, {"cid": cid})
+                        entry["session_type"] = (
+                            sess_info.get("sessionType")
+                            or decoded.get("chatType")
+                            or entry.get("session_type", 0)
+                        )
+                        entry["item_id"] = str(ext.get("itemId") or entry.get("item_id", ""))
+                        entry["participant_user_ids"] = list(
+                            dict.fromkeys(
+                                str(ext[k]).removesuffix("@goofish")
+                                for k in ("ownerUserId", "extUserId")
+                                if ext.get(k)
+                            )
+                        )
+                        continue
+
+                    # b) new_msg：{"1":"cid@goofish","2":1,"3":msgId,"4":ts}
+                    meta = extract_meta_event(decoded)
+                    if meta and meta.get("event") == "new_msg":
+                        cid2 = meta["cid"]
+                        entry = acc.setdefault(cid2, {"cid": cid2})
+                        entry["last_msg_id"] = meta.get("msg_id", "")
+                        entry["last_msg_ts"] = meta.get("ts", "")
+        finally:
+            hb.cancel()
+            with suppress(asyncio.CancelledError):
+                await hb
+
+    # 统一字段 + 填默认值
+    out: list[dict[str, Any]] = []
+    for cid, e in acc.items():
+        out.append(
+            {
+                "cid": cid,
+                "session_type": int(e.get("session_type") or 0),
+                "item_id": e.get("item_id", "") or "",
+                "last_msg_id": e.get("last_msg_id", ""),
+                "last_msg_ts": e.get("last_msg_ts", ""),
+                "participant_user_ids": e.get("participant_user_ids", []),
+            }
+        )
+    return out
+
+
+async def list_user_messages(
+    session: Session,
+    cid: str,
+    limit_per_page: int = 20,
+    limit: int = 0,
+    timeout: float = 30.0,
+) -> list[dict[str, Any]]:
+    """读取历史并保留消息标识与真实时间；limit=0 翻页到底。"""
+    from goofish_mcp.core.message_history import read_history
+
+    return await read_history(session, cid, limit_per_page, limit, timeout)
+
+
+def _decode_one(raw: str) -> dict[str, Any] | None:
+    """三种解码尝试：明文 JSON → base64(JSON) → decrypt。"""
+    if not isinstance(raw, str):
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+    try:
+        return json.loads(base64.b64decode(raw))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        return json.loads(decrypt(raw))
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"decrypt push failed: {e}")
+        return None
+
+
+def extract_push_messages(msg: dict[str, Any]) -> list[dict[str, Any]]:
+    """解析 /s/vulcan 推送包。**一帧可能包含多条 push**（实测 32 条/帧很常见）。
+
+    三种编码尝试：明文 JSON / base64(JSON) / decrypt。任一成功即收录。
+    """
+    try:
+        data_list = msg["body"]["syncPushPackage"]["data"]
+    except (KeyError, TypeError):
+        return []
+    if not isinstance(data_list, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for item in data_list:
+        if not isinstance(item, dict):
+            continue
+        decoded = _decode_one(item.get("data", ""))
+        if decoded is not None:
+            out.append(decoded)
+    return out
+
+
+def extract_push_message(msg: dict[str, Any]) -> dict[str, Any] | None:
+    """[deprecated 保留] 只取第一条 —— 新代码请用 extract_push_messages。"""
+    batch = extract_push_messages(msg)
+    return batch[0] if batch else None
+
+
+def extract_incoming_text(decoded: dict[str, Any]) -> dict[str, Any] | None:
+    """从解码后的推送包里提取一条消息事件。
+
+    两种格式兼容：
+    - 新 web 端（base64(JSON)）：顶层有 operation.content.contentType + sessionId
+    - 老协议（decrypt 返回）：message["1"]["10"] 挂 reminder*/sender*/cid
+    """
+    # —— 新格式 ——
+    op = decoded.get("operation") if isinstance(decoded, dict) else None
+    if isinstance(op, dict):
+        content = op.get("content") or {}
+        content_type = content.get("contentType")
+        sess = op.get("sessionInfo") or {}
+        sender = op.get("senderInfo") or {}
+        reminder = content.get("reminder") or {}
+        cid = str(decoded.get("sessionId") or sess.get("sessionId") or "")
+        # contentType=1 文本；2 图片；8 会话激活；101 是 custom
+        text = ""
+        if content_type == 1:
+            text = (content.get("text") or {}).get("text", "") or reminder.get("reminderContent", "")
+        elif content_type == 101:
+            # custom 包装：data 是 base64(payload)
+            custom = content.get("custom") or {}
+            data_b64 = custom.get("data", "")
+            if data_b64:
+                try:
+                    payload = json.loads(base64.b64decode(data_b64))
+                    text = (payload.get("text") or {}).get("text", "")
+                except Exception:  # noqa: BLE001
+                    text = ""
+            text = text or reminder.get("reminderContent", "")
+        else:
+            text = reminder.get("reminderContent", "")
+
+        return {
+            "event": "message",
+            "cid": cid,
+            "content_type": content_type,
+            "send_user_id": str(sender.get("senderUserId", "") or reminder.get("senderUserId", "")),
+            "send_user_name": reminder.get("reminderTitle", ""),
+            "send_message": text,
+        }
+
+    # —— 老格式（decrypt 后嵌套带正文）——
+    one = decoded.get("1") if isinstance(decoded, dict) else None
+    if isinstance(one, dict):
+        node = one.get("10")
+        if isinstance(node, dict):
+            cid_full = one.get("2", "")
+            cid = cid_full.split("@")[0] if isinstance(cid_full, str) else ""
+            return {
+                "event": "message",
+                "cid": cid,
+                "send_user_id": node.get("senderUserId", ""),
+                "send_user_name": node.get("reminderTitle", ""),
+                "send_message": node.get("reminderContent", ""),
+            }
+
+    return None
+
+
+def extract_meta_event(decoded: dict[str, Any]) -> dict[str, Any] | None:
+    """识别 /s/sync 平结构里的元事件：new_msg 通知 / read receipt。
+
+    new_msg 通知（无正文）：{"1":"cid@goofish","2":1,"3":"msgId","4":"ts"}
+    read receipt：         {"1":[msgIds],"2":2,"3":"cid@goofish","4":1,"5":"ts"}
+
+    没识别出来返回 None；调用方再尝试 extract_incoming_text。
+    """
+    if not isinstance(decoded, dict):
+        return None
+    one, two, three = decoded.get("1"), decoded.get("2"), decoded.get("3")
+
+    # read receipt
+    if isinstance(one, list) and two == 2 and isinstance(three, str) and three.endswith("@goofish"):
+        return {
+            "event": "read",
+            "cid": three.split("@")[0],
+            "msg_ids": [str(x) for x in one],
+            "status": decoded.get("4"),
+            "ts": str(decoded.get("5", "")),
+        }
+
+    # new_msg 轻量通知（cid 在 "1"，msgId 在 "3"）
+    if isinstance(one, str) and one.endswith("@goofish") and two == 1 and isinstance(three, str):
+        return {
+            "event": "new_msg",
+            "cid": one.split("@")[0],
+            "msg_id": three,
+            "ts": str(decoded.get("4", "")),
+        }
+
+    return None
+
+
+MessageHandler = Callable[[dict[str, Any], ClientConnection], Awaitable[None]]
+
+
+async def run_forever(
+    session: Session,
+    handler: MessageHandler | None = None,
+    *,
+    refresh_every: float = 600.0,
+) -> None:
+    """常驻 IM 长连接。每条下行包走 ack，然后丢给 handler。
+
+    handler(msg, ws) —— msg 是 json.loads 后的原始帧；需要业务自己去 extract_push_message。
+    refresh_every 秒调一次 mtop.taobao.idlemessage.pc.loginuser.get 保活。
+
+    外层套重连循环：服务端会不定时关连接（观察约每 10~30 分钟一次），
+    捕获 ConnectionClosed 后指数退避重连 + 重新 reg。
+    """
+    from goofish_mcp.core.token import refresh_login
+
+    async def _keepalive() -> None:
+        while True:
+            await asyncio.sleep(refresh_every)
+            try:
+                refresh_login(session)
+                logger.debug("login refreshed")
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"login refresh failed: {e}")
+
+    async def _one_session() -> None:
+        token = get_access_token(session)
+        async with connect(session) as ws:
+            await register(ws, session, token)
+            hb = asyncio.create_task(heartbeat_loop(ws))
+            try:
+                async for raw in ws:
+                    try:
+                        msg = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+                    with suppress(Exception):
+                        await ws.send(json.dumps(build_ack(msg)))
+                    if handler is not None:
+                        try:
+                            await handler(msg, ws)
+                        except Exception as e:  # noqa: BLE001
+                            logger.exception(f"handler error: {e}")
+            finally:
+                hb.cancel()
+
+    ka = asyncio.create_task(_keepalive())
+    backoff = 1.0
+    try:
+        while True:
+            try:
+                logger.info("WS 连接中…")
+                await _one_session()
+                logger.info("WS 正常退出，3s 后重连")
+                backoff = 1.0
+                await asyncio.sleep(3)
+            except websockets.exceptions.ConnectionClosed as e:
+                logger.warning(f"WS 断连：{e}；{backoff:.1f}s 后重连")
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 30.0)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                logger.exception(f"WS 会话异常：{e}；{backoff:.1f}s 后重连")
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 30.0)
+    finally:
+        ka.cancel()

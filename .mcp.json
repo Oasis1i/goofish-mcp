@@ -1,0 +1,26 @@
+{
+  "mcpServers": {
+    "goofish": {
+      "transport": "stdio",
+      "command": "uvx",
+      "args": [
+        "--from",
+        "goofish-mcp==0.6.3",
+        "python",
+        "-m",
+        "goofish_mcp.mcp_server"
+      ],
+      "connectionTimeoutMs": 120000,
+      "requestTimeoutMs": 120000,
+      "supportsParallelToolCalls": false,
+      "toolFilter": {
+        "exclude": [
+          "auth_login",
+          "auth_reset_guard",
+          "message_watch",
+          "skills_install"
+        ]
+      }
+    }
+  }
+}

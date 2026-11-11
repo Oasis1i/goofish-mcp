@@ -1,0 +1,22 @@
+goofish-mcp
+Copyright 2026 Oasis1i / 曲晓贺
+
+This project is a fork of goofish-cli v0.6.3
+(https://github.com/fancyboi999/goofish-cli), licensed under the
+Apache License, Version 2.0.
+
+Original authors: Xinmin Zeng / fancyboi999.
+
+------------------------------------------------------------------------
+
+goofish-cli
+Copyright 2026 fancy
+
+This tool is provided for lawful automation of the user's own Goofish/Xianyu
+(咸鱼) account. The authors explicitly disallow:
+  - Any use for fraud, scalping, or fake transactions
+  - Reselling this tool as a SaaS targeting the Goofish platform
+  - Any use that violates Goofish/Alibaba Terms of Service
+
+Users are solely responsible for compliance with applicable laws and
+platform policies.
