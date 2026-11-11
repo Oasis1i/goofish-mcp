@@ -263,9 +263,11 @@ $ goofish message watch
 
 | 事件 | 字段 |
 |---|---|
-| `message` | cid · send_user_id · send_user_name · send_message · content_type |
+| `message` | cid · send_user_id · send_user_name · send_message · content_type。原始推送里有则再带 message_id · item_id · session_type · created_at；能对照当前登录用户时带 from_self |
 | `read` | cid · msg_ids[] · status · ts |
 | `new_msg` | cid · msg_id · ts（服务端只推指针，需 `message history` 拉正文） |
+
+已有字段保持原样。新字段缺了就不写，不会补空字符串。
 
 **自动跳过噪音**：`/s/para`（对方正在输入）、`contentType=8`（会话激活心跳）。
 </details>

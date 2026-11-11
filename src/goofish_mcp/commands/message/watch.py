@@ -20,6 +20,35 @@ from goofish_mcp.core.ws import (
 )
 
 
+def events_from_frame(msg: dict[str, Any], *, my_user_id: str = "") -> list[dict[str, Any]]:
+    """把一帧下行解析成 watch 会输出的事件。不连网。
+
+    `/s/para`（正在输入）和没有正文的激活帧被丢掉。元事件优先于正文。
+    """
+    if msg.get("lwp") == "/s/para":
+        return []
+    events: list[dict[str, Any]] = []
+    for decoded in extract_push_messages(msg):
+        meta = extract_meta_event(decoded)
+        if meta is not None:
+            events.append(meta)
+            continue
+        item = extract_incoming_text(decoded, my_user_id=my_user_id)
+        if item is None:
+            continue
+        # 真消息：send_message 非空 或 contentType=1
+        if item.get("send_message") or item.get("content_type") == 1:
+            events.append(item)
+    return events
+
+
+def write_events(events: list[dict[str, Any]]) -> None:
+    for event in events:
+        sys.stdout.write(json.dumps(event, ensure_ascii=False) + "\n")
+    if events:
+        sys.stdout.flush()
+
+
 @command(
     namespace="message",
     name="watch",
@@ -32,24 +61,7 @@ def watch() -> dict[str, Any]:
     logger.info(f"[watch] unb={session.unb} tracknick={session.tracknick}")
 
     async def _handler(msg: dict[str, Any], _ws) -> None:
-        # /s/para 是对方"正在输入"状态通知，跳过避免噪音
-        if msg.get("lwp") == "/s/para":
-            return
-        for decoded in extract_push_messages(msg):
-            # 优先识别元事件（read / new_msg 通知）
-            meta = extract_meta_event(decoded)
-            if meta is not None:
-                sys.stdout.write(json.dumps(meta, ensure_ascii=False) + "\n")
-                sys.stdout.flush()
-                continue
-            # 再尝试嵌套消息正文
-            item = extract_incoming_text(decoded)
-            if item is None:
-                continue
-            # 真消息：send_message 非空 或 contentType=1
-            if item.get("send_message") or item.get("content_type") == 1:
-                sys.stdout.write(json.dumps(item, ensure_ascii=False) + "\n")
-                sys.stdout.flush()
+        write_events(events_from_frame(msg, my_user_id=session.unb))
 
     try:
         asyncio.run(run_forever(session, handler=_handler))
