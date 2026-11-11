@@ -85,7 +85,15 @@ def call(
 
     token = session.h5_token
     if not token:
-        raise AuthRequiredError("_m_h5_tk 缺失，请重新登录并导出 cookie")
+        from goofish_mcp.core.refresh import is_enabled
+
+        if is_enabled():
+            raise AuthRequiredError("_m_h5_tk 缺失，请重新登录并导出 cookie")
+        raise AuthRequiredError(
+            "_m_h5_tk 缺失，需要重新登录。自动刷新已关闭（GOOFISH_AUTO_REFRESH_TOKEN=0），"
+            "守护进程不会打开浏览器。请在本机终端执行 goofish auth login。",
+            needs_relogin=True,
+        )
     sign = generate_sign(t_ms, token, data_val)
 
     params = {
@@ -124,7 +132,13 @@ def call(
             raise
         from goofish_mcp.core.refresh import is_enabled, refresh_cookies_via_browser
         if not is_enabled():
-            raise
+            raise AuthRequiredError(
+                f"登录态已失效，需要重新登录（{e}）。自动刷新已关闭"
+                "（GOOFISH_AUTO_REFRESH_TOKEN=0），守护进程不会打开浏览器。"
+                "请在本机终端执行 goofish auth login。",
+                raw=e.raw,
+                needs_relogin=True,
+            ) from e
         logger.info(f"[{api}] 检测到登录态失效，尝试 Playwright 免密登录刷新 cookie…")
         if not refresh_cookies_via_browser(session):
             raise

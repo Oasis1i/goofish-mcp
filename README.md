@@ -118,6 +118,29 @@ goofish sandbox run search items '机械键盘' --limit 3
 
 ---
 
+## Batch auto-reply workflow
+
+这套流程跑在你自己的 Mac 上，走住宅 IP。账号刚被闲鱼风控过，所以默认把发送量压得很低：每天最多自动回复 15 条，同一个买家 20 分钟内只回一次。售后、退款、议价和投诉留给人工。
+
+守护进程先关掉浏览器自动续期，避免 cookie 过期时弹出 Chrome：
+
+```bash
+export GOOFISH_AUTO_REFRESH_TOKEN=0
+```
+
+1. 常驻收集。`goofish message collect` 把 `message watch` 的事件按 `message_id` 写入 `~/.goofish-cli/inbox.sqlite`（`GOOFISH_INBOX_PATH` 或 `GOOFISH_STATE_DIR` 可改路径）。断线之后它会重新注册 WebSocket；`ackDiff` 用的是当前时间，不会把离线期间的正文补回来。Mac 睡眠或断开之后，用 `goofish message backfill` 走 `list-chats` 和有界 `history` 把缺口补进同一个收件箱。
+2. 每 30 分钟读一次队列。`goofish message pending --format json` 按会话给出还没处理的消息，`merged_text` 是这个会话里待回复的买家正文。
+3. 起草一句短回复，先空跑。`goofish message reply <cid> <toid> --text "在的，还在的" --dry-run`。它会跳过自己发出的消息，以及 `session_type` 不是 1 的系统会话和通知；买家原文如果是售后、退款、议价或投诉，结果是 `needs_human`，不会发送。草稿里的微信、VX、QQ、手机号、支付宝和转账按 `skills/goofish-risk-guard/references/external-contact-keywords.md` 拦住。
+4. 确认是普通咨询后去掉 `--dry-run` 再发。真正发送仍走原来的 `message send`，每分钟的写限流和风控熔断保持原样。每次决定追加到 `~/.goofish-cli/reply-audit.jsonl`。
+5. 处理完这个会话后执行 `goofish message mark-handled <cid>`。
+6. 登录失效时，`goofish auth status --format json` 返回 `status` 为 `needs_relogin`、`needs_relogin` 为 true。其他命令也会在 stdout 打出同样的 JSON，退出码 77。在本机终端重新 `goofish auth login`，再把守护进程拉起来。
+
+```json
+{"ok": false, "valid": false, "needs_relogin": true, "status": "needs_relogin", "auto_refresh": false, "error": "登录态已失效，需要重新登录"}
+```
+
+---
+
 ## 🧩 Claude Skills（v0.3 新增）
 
 v0.3 起内置 5 个 Claude Skill，装完之后 Claude Code / Cursor 里的 Agent 在识别到

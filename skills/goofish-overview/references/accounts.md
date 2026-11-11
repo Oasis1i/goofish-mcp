@@ -37,7 +37,7 @@ goto /bought 触发完整 session cookie 下发 → 合并回 session → 重试
 | 变量 | 作用 |
 |---|---|
 | `GOOFISH_COOKIES_PATH` | 自定义 cookies.json 路径 |
-| `GOOFISH_AUTO_REFRESH_TOKEN=0` | 关掉自动刷新（CI 用） |
+| `GOOFISH_AUTO_REFRESH_TOKEN=0` | 关掉 Playwright 自动刷新。CI 和 `message collect` 守护进程都要设。关闭后登录失效返回 `needs_relogin`，不打开浏览器 |
 | `GOOFISH_QR_TIMEOUT=N` | 扫码超时秒数（默认 120） |
 | `GOOFISH_HEADLESS=1` | 浏览器 headless（会触发风控，慎用） |
 | `GOOFISH_NO_CHROME_BOOTSTRAP=1` | 禁止从本机 Chrome 自动抓 cookie |

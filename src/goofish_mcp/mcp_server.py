@@ -27,6 +27,7 @@ from mcp.server.fastmcp import FastMCP
 from goofish_mcp.core import GoofishError, iter_commands
 from goofish_mcp.core.errors import PartialResultError
 from goofish_mcp.core.registry import discover
+from goofish_mcp.core.relogin import error_payload
 
 mcp = FastMCP("goofish")
 
@@ -60,7 +61,7 @@ def _register_one(cmd) -> None:
         except PartialResultError as e:
             return {"ok": False, "data": e.data, "error": e.error, "message": str(e)}
         except GoofishError as e:
-            return {"ok": False, "error_type": type(e).__name__, "message": str(e)}
+            return error_payload(e)
 
     handler.__name__ = tool_name
     handler.__doc__ = doc
