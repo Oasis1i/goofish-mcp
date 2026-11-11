@@ -32,16 +32,17 @@ bundle 默认过滤以下工具：
 |---|---|
 | `auth_login` | 会覆盖磁盘登录态，应由用户在终端执行 |
 | `auth_reset_guard` | 恢复动作需要用户判断，且不能解除服务端风控 |
+| `message_collect` | 和 `message_watch` 一样是常驻阻塞连接，只是多写本地收件箱 |
 | `message_watch` | 常驻阻塞式连接，不适合作为单次 Agent tool |
 | `skills_install` | bundle 已直接提供 skills，无需 Agent 再安装 |
 
 OpenClaw `2026.7.1` 的 `openclaw mcp doctor` 只读取 `openclaw.json` 中的
 `mcp.servers`，不会读取 bundle 的 `.mcp.json`；因此插件验收应使用 `plugins inspect`
 和 embedded agent 新会话的 trajectory 工具目录，不要重复配置同一个 server
-只为运行 doctor。验收时应看到 13 个 Goofish 业务工具，且不应看到上表的
-4 个过滤工具。OpenClaw 还会为 MCP prompts/resources 生成
+只为运行 doctor。验收时应看到 16 个 Goofish 业务工具，且不应看到上表的
+5 个过滤工具。OpenClaw 还会为 MCP prompts/resources 生成
 `goofish__prompts_*` 和 `goofish__resources_*` 4 个桥接工具，因此按
-`goofish__*` 前缀统计的总数是 17，不代表 `toolFilter` 失效。
+`goofish__*` 前缀统计的总数是 20，不代表 `toolFilter` 失效。
 
 ## Claude Code
 
@@ -98,6 +99,10 @@ OpenClaw `2026.7.1` 的 `openclaw mcp doctor` 只读取 `openclaw.json` 中的
 | `message_list_chats` | 会话列表 |
 | `message_send` | 发送消息（写） |
 | `message_watch` | 监听消息（常驻） |
+| `message_collect` | 监听消息并写入本地收件箱（常驻） |
+| `message_backfill` | 用会话列表和历史补回断线消息 |
+| `message_pending` | 按会话读取未处理消息 |
+| `message_mark_handled` | 把会话标成已处理 |
 | `skills_install` | 安装内置 Skills |
 
 ## 首次使用
