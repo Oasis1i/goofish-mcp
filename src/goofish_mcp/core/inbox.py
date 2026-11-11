@@ -11,6 +11,9 @@ from typing import Any
 
 from goofish_mcp.core.errors import GoofishError
 
+DEFAULT_DAILY_CAP = 15
+DEFAULT_COOLDOWN_SECONDS = 20 * 60
+
 
 def state_dir() -> Path:
     raw = os.environ.get("GOOFISH_STATE_DIR") or str(Path.home() / ".goofish-cli")
@@ -169,6 +172,18 @@ class Inbox:
                 peer_nick TEXT NOT NULL DEFAULT '',
                 handled INTEGER NOT NULL DEFAULT 0,
                 handled_at INTEGER
+            );
+
+            CREATE TABLE IF NOT EXISTS reply_policy (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                daily_cap INTEGER NOT NULL,
+                cooldown_seconds INTEGER NOT NULL,
+                day TEXT NOT NULL,
+                sent_count INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS buyer_cooldown (
+                buyer_id TEXT PRIMARY KEY,
+                last_sent_at REAL NOT NULL
             );
             """
         )
@@ -368,6 +383,188 @@ class Inbox:
                 marked = cursor.rowcount
                 absent = False
         return {"cid": cid, "handled": True, "marked_messages": marked, "absent": absent}
+
+    def conversation(self, cid: str) -> dict[str, Any] | None:
+        cid = _norm(cid)
+        if not cid:
+            return None
+        conv = self._conn.execute(
+            "SELECT * FROM conversations WHERE cid = ?",
+            (cid,),
+        ).fetchone()
+        if conv is None:
+            return None
+        rows = self._conn.execute(
+            """
+            SELECT * FROM messages
+            WHERE cid = ? AND handled = 0
+            ORDER BY COALESCE(created_at, inserted_at), row_id
+            """,
+            (cid,),
+        ).fetchall()
+        messages = [_message_row(row) for row in rows]
+        buyer = [item for item in messages if not item.get("from_self")]
+        return {
+            "cid": cid,
+            "session_type": conv["session_type"],
+            "handled": bool(conv["handled"]),
+            "item_id": conv["item_id"],
+            "peer_user_id": conv["peer_user_id"],
+            "peer_nick": conv["peer_nick"],
+            "messages": messages,
+            "merged_text": "\n".join(item["send_message"] for item in buyer if item["send_message"]),
+        }
+
+    def limits(self, *, today: str | None = None) -> dict[str, int]:
+        today = today or time.strftime("%Y-%m-%d")
+        row = self._ensure_policy(today)
+        return {
+            "daily_cap": int(row["daily_cap"]),
+            "cooldown_seconds": int(row["cooldown_seconds"]),
+        }
+
+    def set_limits(
+        self,
+        *,
+        daily_cap: int | None = None,
+        cooldown_seconds: int | None = None,
+        today: str | None = None,
+    ) -> dict[str, int]:
+        today = today or time.strftime("%Y-%m-%d")
+        self._ensure_policy(today)
+        if daily_cap is not None:
+            if daily_cap < 0 or daily_cap > 100:
+                raise GoofishError("daily-cap 必须为 0–100")
+            self._conn.execute(
+                "UPDATE reply_policy SET daily_cap = ? WHERE id = 1",
+                (daily_cap,),
+            )
+        if cooldown_seconds is not None:
+            if cooldown_seconds < 0 or cooldown_seconds > 24 * 3600:
+                raise GoofishError("cooldown-seconds 必须为 0–86400")
+            self._conn.execute(
+                "UPDATE reply_policy SET cooldown_seconds = ? WHERE id = 1",
+                (cooldown_seconds,),
+            )
+        self._conn.commit()
+        return self.limits(today=today)
+
+    def quota_view(self, buyer_id: str, *, now: float, today: str) -> dict[str, Any]:
+        row = self._ensure_policy(today)
+        sent = int(row["sent_count"]) if row["day"] == today else 0
+        cooldown = int(row["cooldown_seconds"])
+        last = self._last_sent(buyer_id)
+        remaining = 0.0
+        if last is not None and cooldown > 0 and now - last < cooldown:
+            remaining = cooldown - (now - last)
+        return {
+            "daily_sent": sent,
+            "daily_cap": int(row["daily_cap"]),
+            "cooldown_seconds": cooldown,
+            "cooldown_remaining": remaining,
+            "last_sent_at": last,
+        }
+
+    def reserve_send(self, buyer_id: str, *, now: float, today: str) -> dict[str, Any]:
+        """占一次每日额度和买家冷却。失败不改计数。调用方发送失败时要 release_send。"""
+        buyer_id = _norm(buyer_id)
+        with self._conn:
+            row = self._conn.execute("SELECT * FROM reply_policy WHERE id = 1").fetchone()
+            if row is None:
+                self._conn.execute(
+                    """
+                    INSERT INTO reply_policy (id, daily_cap, cooldown_seconds, day, sent_count)
+                    VALUES (1, ?, ?, ?, 0)
+                    """,
+                    (DEFAULT_DAILY_CAP, DEFAULT_COOLDOWN_SECONDS, today),
+                )
+                row = self._conn.execute("SELECT * FROM reply_policy WHERE id = 1").fetchone()
+            sent = int(row["sent_count"]) if row["day"] == today else 0
+            cap = int(row["daily_cap"])
+            cooldown = int(row["cooldown_seconds"])
+            last = self._last_sent(buyer_id)
+            if last is not None and cooldown > 0 and now - last < cooldown:
+                return {
+                    "ok": False,
+                    "reason": "cooldown",
+                    "daily_sent": sent,
+                    "daily_cap": cap,
+                    "cooldown_remaining": cooldown - (now - last),
+                }
+            if sent >= cap:
+                return {
+                    "ok": False,
+                    "reason": "daily_cap",
+                    "daily_sent": sent,
+                    "daily_cap": cap,
+                    "cooldown_remaining": 0.0,
+                }
+            self._conn.execute(
+                "UPDATE reply_policy SET day = ?, sent_count = ? WHERE id = 1",
+                (today, sent + 1),
+            )
+            self._conn.execute(
+                """
+                INSERT INTO buyer_cooldown (buyer_id, last_sent_at) VALUES (?, ?)
+                ON CONFLICT(buyer_id) DO UPDATE SET last_sent_at = excluded.last_sent_at
+                """,
+                (buyer_id, now),
+            )
+        return {
+            "ok": True,
+            "reason": "reserved",
+            "daily_sent": sent + 1,
+            "daily_cap": cap,
+            "previous_last": last,
+            "today": today,
+            "buyer_id": buyer_id,
+        }
+
+    def release_send(self, reservation: dict[str, Any]) -> None:
+        if not reservation.get("ok"):
+            return
+        buyer_id = reservation["buyer_id"]
+        today = reservation["today"]
+        previous = reservation.get("previous_last")
+        with self._conn:
+            row = self._conn.execute(
+                "SELECT day, sent_count FROM reply_policy WHERE id = 1"
+            ).fetchone()
+            if row is not None and row["day"] == today:
+                self._conn.execute(
+                    "UPDATE reply_policy SET sent_count = ? WHERE id = 1",
+                    (max(0, int(row["sent_count"]) - 1),),
+                )
+            if previous is None:
+                self._conn.execute("DELETE FROM buyer_cooldown WHERE buyer_id = ?", (buyer_id,))
+            else:
+                self._conn.execute(
+                    "UPDATE buyer_cooldown SET last_sent_at = ? WHERE buyer_id = ?",
+                    (previous, buyer_id),
+                )
+
+    def _ensure_policy(self, today: str) -> sqlite3.Row:
+        row = self._conn.execute("SELECT * FROM reply_policy WHERE id = 1").fetchone()
+        if row is None:
+            self._conn.execute(
+                """
+                INSERT INTO reply_policy (id, daily_cap, cooldown_seconds, day, sent_count)
+                VALUES (1, ?, ?, ?, 0)
+                """,
+                (DEFAULT_DAILY_CAP, DEFAULT_COOLDOWN_SECONDS, today),
+            )
+            self._conn.commit()
+            row = self._conn.execute("SELECT * FROM reply_policy WHERE id = 1").fetchone()
+        return row
+
+    def _last_sent(self, buyer_id: str) -> float | None:
+        row = self._conn.execute(
+            "SELECT last_sent_at FROM buyer_cooldown WHERE buyer_id = ?",
+            (_norm(buyer_id),),
+        ).fetchone()
+        if row is None:
+            return None
+        return float(row["last_sent_at"])
 
 
 def _buyer_reopens(

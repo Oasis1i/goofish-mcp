@@ -39,10 +39,10 @@ bundle 默认过滤以下工具：
 OpenClaw `2026.7.1` 的 `openclaw mcp doctor` 只读取 `openclaw.json` 中的
 `mcp.servers`，不会读取 bundle 的 `.mcp.json`；因此插件验收应使用 `plugins inspect`
 和 embedded agent 新会话的 trajectory 工具目录，不要重复配置同一个 server
-只为运行 doctor。验收时应看到 16 个 Goofish 业务工具，且不应看到上表的
+只为运行 doctor。验收时应看到 17 个 Goofish 业务工具，且不应看到上表的
 5 个过滤工具。OpenClaw 还会为 MCP prompts/resources 生成
 `goofish__prompts_*` 和 `goofish__resources_*` 4 个桥接工具，因此按
-`goofish__*` 前缀统计的总数是 20，不代表 `toolFilter` 失效。
+`goofish__*` 前缀统计的总数是 21，不代表 `toolFilter` 失效。
 
 ## Claude Code
 
@@ -98,6 +98,7 @@ OpenClaw `2026.7.1` 的 `openclaw mcp doctor` 只读取 `openclaw.json` 中的
 | `message_history` | 消息历史 |
 | `message_list_chats` | 会话列表 |
 | `message_send` | 发送消息（写） |
+| `message_reply` | 带护栏的回复（冷却、每日上限、外联词、转人工） |
 | `message_watch` | 监听消息（常驻） |
 | `message_collect` | 监听消息并写入本地收件箱（常驻） |
 | `message_backfill` | 用会话列表和历史补回断线消息 |

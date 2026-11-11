@@ -54,7 +54,7 @@ https://github.com/user-attachments/assets/ae20ae2f-ccdf-4d3e-a947-69182d4c4eff
 
 ## ✨ 核心特性
 
-- 🔐 **21 个命令覆盖核心链路**：发布、下架、查询、图片上传、AI 类目识别、默认地址、IM 收发 + 会话列表、本地收件箱、skills 安装
+- 🔐 **22 个命令覆盖核心链路**：发布、下架、查询、图片上传、AI 类目识别、默认地址、IM 收发 + 会话列表、本地收件箱、带护栏的回复、skills 安装
 - 📡 **真·实时 IM**：WebSocket 长连 + 自动重连 + **三类事件分类输出**
   - `event=message`（收到消息）· `event=read`（已读回执）· `event=new_msg`（轻量通知）
 - 🛡 **内置风控护栏**：账号与业务桶限流（经营 1 次/分钟、媒体 9 次/分钟）+ RGV587 自动熔断
@@ -211,6 +211,7 @@ $ goofish list-commands --format table
 | `item view` | 浏览器视角看商品详情（字段完整，抗风控；`item get` 的姊妹版） | ❌ |
 | `message history` | 拉取会话历史消息 | ❌ |
 | `message send` | 发送文本/图片 | ✅ |
+| `message reply` | 带护栏回复（冷却、每日上限、外联词；售后/议价转人工） | ✅ |
 | `message watch` | 常驻 IM 长连（JSONL 输出） | ❌ |
 | `message collect` | 常驻接收并写入本地收件箱（按 message_id 去重） | ❌ |
 | `message backfill` | 用 list-chats + history 补回断线期间的消息 | ❌ |
