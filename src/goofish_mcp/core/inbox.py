@@ -174,6 +174,19 @@ class Inbox:
                 handled_at INTEGER
             );
 
+            CREATE TABLE IF NOT EXISTS agent_escalations (
+                id INTEGER PRIMARY KEY,
+                cid TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                day TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS agent_handoffs (
+                cid TEXT PRIMARY KEY,
+                reason TEXT NOT NULL,
+                created_at REAL NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS reply_policy (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 daily_cap INTEGER NOT NULL,
@@ -414,6 +427,56 @@ class Inbox:
             "messages": messages,
             "merged_text": "\n".join(item["send_message"] for item in buyer if item["send_message"]),
         }
+
+    def is_escalated(self, cid: str) -> bool:
+        return self._conn.execute(
+            "SELECT 1 FROM agent_handoffs WHERE cid = ?", (_norm(cid),)
+        ).fetchone() is not None
+
+    def escalate(self, cid: str, reason: str) -> dict[str, Any]:
+        cid = _norm(cid)
+        reason = reason.strip()
+        if not cid or not reason:
+            raise GoofishError("cid 和 reason 不能为空")
+        now = time.time()
+        with self._conn:
+            self._conn.execute(
+                "INSERT INTO agent_escalations (cid, reason, created_at, day) VALUES (?, ?, ?, ?)",
+                (cid, reason, now, time.strftime("%Y-%m-%d", time.localtime(now))),
+            )
+            self._conn.execute(
+                "INSERT INTO agent_handoffs (cid, reason, created_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(cid) DO UPDATE SET reason=excluded.reason, "
+                "created_at=excluded.created_at", (cid, reason, now),
+            )
+        return {"ok": True, "cid": cid, "escalated": True, "reason": reason, "ts": now}
+
+    def recent_messages(self, cid: str, limit: int = 10) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT * FROM messages WHERE cid = ? "
+            "ORDER BY COALESCE(created_at, inserted_at) DESC, row_id DESC LIMIT ?",
+            (_norm(cid), limit),
+        ).fetchall()
+        return [_message_row(row) for row in reversed(rows)]
+
+    def local_item(self, cid: str, item_id: str) -> dict[str, Any]:
+        item = {"item_id": item_id}
+        rows = self._conn.execute(
+            "SELECT raw_json FROM messages WHERE cid = ? ORDER BY row_id", (_norm(cid),)
+        ).fetchall()
+        for row in rows:
+            event = json.loads(row["raw_json"])
+            if str(event.get("item_id") or "") != item_id:
+                continue
+            for key in ("title", "price", "item_title", "item_price"):
+                if event.get(key) is not None:
+                    item[key] = event[key]
+        return item
+
+    def escalation_count(self, day: str) -> int:
+        return self._conn.execute(
+            "SELECT COUNT(*) FROM agent_escalations WHERE day = ?", (day,)
+        ).fetchone()[0]
 
     def limits(self, *, today: str | None = None) -> dict[str, int]:
         today = today or time.strftime("%Y-%m-%d")

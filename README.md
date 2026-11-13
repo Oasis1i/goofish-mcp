@@ -418,3 +418,9 @@ uv run ruff check src tests  # 零告警
 ## 📜 License
 
 Apache-2.0 © 2026 fancy；本 fork 由 Oasis1i 维护。详见 [LICENSE](./LICENSE) 和 [NOTICE](./NOTICE)。
+
+### Agent 账号级 HTTP MCP
+
+Grok Bot / 同类 Agent 可通过五个高层工具读取 inbox、带护栏回复、转人工及统计。
+HTTP 入口提供独立读/写 Bearer token，默认仅监听本机；原 stdio MCP 保持兼容。
+启动、Mac 隧道与账号级连接器配置见 [Agent HTTP MCP 文档](docs/agent-http-mcp.md)。
