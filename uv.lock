@@ -332,6 +332,7 @@ dependencies = [
     { name = "rich" },
     { name = "tenacity" },
     { name = "typer" },
+    { name = "uvicorn" },
     { name = "websockets" },
 ]
 
@@ -349,7 +350,7 @@ requires-dist = [
     { name = "cryptography", specifier = ">=41.0" },
     { name = "filelock", specifier = ">=3.16,<4" },
     { name = "loguru", specifier = ">=0.7" },
-    { name = "mcp", specifier = ">=1.2,<2" },
+    { name = "mcp", specifier = ">=1.26,<2" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.10" },
     { name = "playwright", specifier = ">=1.58.0" },
     { name = "pydantic", specifier = ">=2.6" },
@@ -362,6 +363,7 @@ requires-dist = [
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.4" },
     { name = "tenacity", specifier = ">=8.2" },
     { name = "typer", specifier = ">=0.12" },
+    { name = "uvicorn", specifier = ">=0.30" },
     { name = "websockets", specifier = ">=13" },
 ]
 provides-extras = ["dev"]

@@ -30,7 +30,8 @@ dependencies = [
   "tenacity>=8.2",
   # v2 renames FastMCP to MCPServer and requires a server migration.
   # Keep the existing FastMCP implementation on the maintained v1 line for now.
-  "mcp>=1.2,<2",
+  "mcp>=1.26,<2",
+  "uvicorn>=0.30",
   "websockets>=13",
   "browser-cookie3>=0.20",
   "playwright>=1.58.0",
