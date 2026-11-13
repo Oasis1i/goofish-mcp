@@ -89,6 +89,119 @@ def test_incoming_text_legacy_format():
     }
 
 
+def test_incoming_text_keeps_context_present_on_new_payload():
+    decoded = {
+        "sessionId": "test-cid@goofish",
+        "messageId": "test-msg.PNM",
+        "createAt": 1776770736198,
+        "chatType": 99,
+        "operation": {
+            "content": {
+                "contentType": 1,
+                "text": {"text": "在吗"},
+                "reminder": {
+                    "reminderTitle": "买家",
+                    "senderUserId": "buyer-1",
+                    "reminderUrl": "fleamarket://message_chat?itemId=1045171414271",
+                },
+            },
+            "senderInfo": {"senderUserId": "buyer-1"},
+            "sessionInfo": {
+                "sessionType": 1,
+                "extensions": {"itemId": "1045171414271"},
+            },
+        },
+    }
+    got = extract_incoming_text(decoded, my_user_id="seller-1")
+    assert got["cid"] == "test-cid@goofish"
+    assert got["send_message"] == "在吗"
+    assert got["message_id"] == "test-msg.PNM"
+    assert got["item_id"] == "1045171414271"
+    assert got["session_type"] == 1
+    assert got["created_at"] == 1776770736198
+    assert got["from_self"] is False
+
+
+def test_incoming_text_from_self_and_legacy_numeric_keys():
+    decoded = {
+        "1": {
+            "2": "test-cid@goofish",
+            "3": "legacy-msg",
+            "5": 1776770736000,
+            "10": {
+                "senderUserId": "seller-1@goofish",
+                "reminderTitle": "我",
+                "reminderContent": "在的",
+                "sessionType": 1,
+                "reminderUrl": "https://www.goofish.com/item?id=1045171414271",
+            },
+        }
+    }
+    got = extract_incoming_text(decoded, my_user_id="seller-1")
+    assert got["message_id"] == "legacy-msg"
+    assert got["created_at"] == 1776770736000
+    assert got["session_type"] == 1
+    assert got["item_id"] == "1045171414271"
+    assert got["from_self"] is True
+    assert got["cid"] == "test-cid"
+    assert got["send_user_id"] == "seller-1@goofish"
+
+
+def test_incoming_text_omits_context_the_payload_does_not_have():
+    decoded = {
+        "sessionId": "12345",
+        "operation": {
+            "content": {"contentType": 1, "text": {"text": "你好"}},
+            "senderInfo": {"senderUserId": "test-user"},
+        },
+    }
+    got = extract_incoming_text(decoded)
+    assert "message_id" not in got
+    assert "item_id" not in got
+    assert "session_type" not in got
+    assert "created_at" not in got
+    assert "from_self" not in got
+
+
+def test_incoming_text_session_type_zero_is_kept():
+    """0 是未分类，不能因为 or 回退被吃掉。"""
+    decoded = {
+        "sessionId": "12345",
+        "chatType": 1,
+        "operation": {
+            "content": {"contentType": 1, "text": {"text": "你好"}},
+            "sessionInfo": {"sessionType": 0, "extensions": {}},
+            "senderInfo": {"senderUserId": "test-user"},
+        },
+    }
+    got = extract_incoming_text(decoded)
+    assert got["session_type"] == 0
+
+
+def test_watch_frame_passes_logged_in_user_and_skips_typing():
+    from goofish_mcp.commands.message.watch import events_from_frame
+
+    payload = {
+        "sessionId": "test-cid",
+        "messageId": "test-msg.PNM",
+        "createAt": 1776770736198,
+        "operation": {
+            "content": {"contentType": 1, "text": {"text": "在吗"}},
+            "senderInfo": {"senderUserId": "seller-1"},
+            "sessionInfo": {"sessionType": 1},
+        },
+    }
+    frame = {
+        "lwp": "/s/sync",
+        "body": {"syncPushPackage": {"data": [{"data": json.dumps(payload)}]}},
+    }
+    events = events_from_frame(frame, my_user_id="seller-1")
+    assert len(events) == 1
+    assert events[0]["from_self"] is True
+    assert events[0]["message_id"] == "test-msg.PNM"
+    assert events_from_frame({"lwp": "/s/para", "body": {}}) == []
+
+
 def test_meta_event_read_receipt():
     """{"1":[msgIds],"2":2,"3":"cid@goofish","4":1,"5":"ts"} → 已读回执。"""
     decoded = {

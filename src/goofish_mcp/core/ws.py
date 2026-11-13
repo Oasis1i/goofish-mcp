@@ -15,10 +15,12 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import re
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 import websockets
 from loguru import logger
@@ -488,30 +490,136 @@ def extract_push_message(msg: dict[str, Any]) -> dict[str, Any] | None:
     return batch[0] if batch else None
 
 
-def extract_incoming_text(decoded: dict[str, Any]) -> dict[str, Any] | None:
+def _as_text(value: Any) -> str:
+    """标量转成去空白的字符串。dict/list 不是标识。"""
+    if value is None or isinstance(value, (bool, dict, list)):
+        return ""
+    return str(value).strip()
+
+
+def _as_int(value: Any) -> int | None:
+    """保留 0。缺省、布尔和非法值返回 None，避免把缺失伪装成未分类。"""
+    if isinstance(value, bool) or value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _as_positive_int(value: Any) -> int | None:
+    number = _as_int(value)
+    if number is None or number <= 0:
+        return None
+    return number
+
+
+def _first_text(*values: Any) -> str:
+    for value in values:
+        text = _as_text(value)
+        if text:
+            return text
+    return ""
+
+
+def _first_positive(*values: Any) -> int | None:
+    for value in values:
+        number = _as_positive_int(value)
+        if number is not None:
+            return number
+    return None
+
+
+def _first_int(*values: Any) -> int | None:
+    for value in values:
+        number = _as_int(value)
+        if number is not None:
+            return number
+    return None
+
+
+def _item_id_from_url(url: Any) -> str:
+    text = _as_text(url)
+    if not text:
+        return ""
+    parsed = urlparse(text)
+    query = parse_qs(parsed.query)
+    for key in ("itemId", "item_id", "id"):
+        for item in query.get(key) or []:
+            if re.fullmatch(r"\d{6,20}", item or ""):
+                return item
+    match = re.search(r"/item/(\d{6,20})", text)
+    return match.group(1) if match else ""
+
+
+def _with_message_context(
+    event: dict[str, Any],
+    *,
+    message_id: str = "",
+    item_id: str = "",
+    session_type: int | None = None,
+    created_at: int | None = None,
+    my_user_id: str = "",
+) -> dict[str, Any]:
+    """只在原始推送里真有值时附加字段，避免把缺失写成空值。"""
+    if message_id:
+        event["message_id"] = message_id
+    if item_id:
+        event["item_id"] = item_id
+    if session_type is not None:
+        event["session_type"] = session_type
+    if created_at is not None:
+        event["created_at"] = created_at
+    sender = _as_text(event.get("send_user_id")).removesuffix("@goofish")
+    mine = _as_text(my_user_id).removesuffix("@goofish")
+    if sender and mine:
+        event["from_self"] = sender == mine
+    return event
+
+
+def extract_incoming_text(
+    decoded: dict[str, Any], *, my_user_id: str = ""
+) -> dict[str, Any] | None:
     """从解码后的推送包里提取一条消息事件。
 
     两种格式兼容：
     - 新 web 端（base64(JSON)）：顶层有 operation.content.contentType + sessionId
     - 老协议（decrypt 返回）：message["1"]["10"] 挂 reminder*/sender*/cid
+
+    原有字段保持不变。message_id / item_id / session_type / created_at 只在
+    原始包里带了对应值时才出现；传入当前登录用户 id 时再附带 from_self。
     """
     # —— 新格式 ——
     op = decoded.get("operation") if isinstance(decoded, dict) else None
     if isinstance(op, dict):
         content = op.get("content") or {}
+        if not isinstance(content, dict):
+            content = {}
         content_type = content.get("contentType")
         sess = op.get("sessionInfo") or {}
+        if not isinstance(sess, dict):
+            sess = {}
         sender = op.get("senderInfo") or {}
+        if not isinstance(sender, dict):
+            sender = {}
         reminder = content.get("reminder") or {}
+        if not isinstance(reminder, dict):
+            reminder = {}
+        extensions = sess.get("extensions") or {}
+        if not isinstance(extensions, dict):
+            extensions = {}
         cid = str(decoded.get("sessionId") or sess.get("sessionId") or "")
         # contentType=1 文本；2 图片；8 会话激活；101 是 custom
         text = ""
         if content_type == 1:
-            text = (content.get("text") or {}).get("text", "") or reminder.get("reminderContent", "")
+            text_node = content.get("text") or {}
+            if not isinstance(text_node, dict):
+                text_node = {}
+            text = text_node.get("text", "") or reminder.get("reminderContent", "")
         elif content_type == 101:
             # custom 包装：data 是 base64(payload)
             custom = content.get("custom") or {}
-            data_b64 = custom.get("data", "")
+            data_b64 = custom.get("data", "") if isinstance(custom, dict) else ""
             if data_b64:
                 try:
                     payload = json.loads(base64.b64decode(data_b64))
@@ -522,7 +630,7 @@ def extract_incoming_text(decoded: dict[str, Any]) -> dict[str, Any] | None:
         else:
             text = reminder.get("reminderContent", "")
 
-        return {
+        event = {
             "event": "message",
             "cid": cid,
             "content_type": content_type,
@@ -530,6 +638,37 @@ def extract_incoming_text(decoded: dict[str, Any]) -> dict[str, Any] | None:
             "send_user_name": reminder.get("reminderTitle", ""),
             "send_message": text,
         }
+        item_id = _first_text(
+            extensions.get("itemId"),
+            decoded.get("itemId"),
+            content.get("itemId"),
+            reminder.get("itemId"),
+        ) or _item_id_from_url(
+            reminder.get("reminderUrl") or content.get("reminderUrl") or decoded.get("reminderUrl")
+        )
+        return _with_message_context(
+            event,
+            message_id=_first_text(
+                decoded.get("messageId"),
+                decoded.get("msgId"),
+                op.get("messageId"),
+                content.get("messageId"),
+                reminder.get("messageId"),
+            ),
+            item_id=item_id,
+            # sessionType 优先；缺失时才用 chatType，与会话发现的回退一致。
+            session_type=_first_int(
+                sess.get("sessionType"), decoded.get("sessionType"), decoded.get("chatType")
+            ),
+            created_at=_first_positive(
+                decoded.get("createAt"),
+                decoded.get("createdAt"),
+                op.get("createAt"),
+                content.get("createAt"),
+                reminder.get("createAt"),
+            ),
+            my_user_id=my_user_id,
+        )
 
     # —— 老格式（decrypt 后嵌套带正文）——
     one = decoded.get("1") if isinstance(decoded, dict) else None
@@ -538,13 +677,23 @@ def extract_incoming_text(decoded: dict[str, Any]) -> dict[str, Any] | None:
         if isinstance(node, dict):
             cid_full = one.get("2", "")
             cid = cid_full.split("@")[0] if isinstance(cid_full, str) else ""
-            return {
+            event = {
                 "event": "message",
                 "cid": cid,
                 "send_user_id": node.get("senderUserId", ""),
                 "send_user_name": node.get("reminderTitle", ""),
                 "send_message": node.get("reminderContent", ""),
             }
+            # 数字键是老协议： "3" 消息 id，"5" 毫秒时间。正文在 "10"。
+            return _with_message_context(
+                event,
+                message_id=_first_text(node.get("messageId"), one.get("3")),
+                item_id=_first_text(node.get("itemId"))
+                or _item_id_from_url(node.get("reminderUrl")),
+                session_type=_first_int(node.get("sessionType"), one.get("sessionType")),
+                created_at=_first_positive(node.get("createAt"), one.get("5")),
+                my_user_id=my_user_id,
+            )
 
     return None
 
