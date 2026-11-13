@@ -54,6 +54,7 @@ test("keeps the OpenClaw package aligned with goofish-mcp", () => {
   assert.deepEqual(server.toolFilter.exclude.toSorted(), [
     "auth_login",
     "auth_reset_guard",
+    "message_collect",
     "message_watch",
     "skills_install",
   ]);

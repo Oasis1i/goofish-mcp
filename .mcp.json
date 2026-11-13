@@ -17,6 +17,7 @@
         "exclude": [
           "auth_login",
           "auth_reset_guard",
+          "message_collect",
           "message_watch",
           "skills_install"
         ]
