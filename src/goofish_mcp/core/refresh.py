@@ -15,7 +15,9 @@ tmp profile 后，服务端因为指纹不对会把这份 cookie 视为"半失�
 3. 等 modal 消失 → goto `/bought` 触发强鉴权页下发完整 session
 4. 抓 Playwright context.cookies() 作为新快照
 
-开关：`GOOFISH_AUTO_REFRESH_TOKEN=0` 可关闭（CI 或想自定义刷新策略时）。
+开关：`GOOFISH_AUTO_REFRESH_TOKEN=0` 可关闭。CI，以及在 Mac 上跑
+`message collect` 这类守护进程时都应该关掉。关闭后登录失效不会打开
+Playwright/Chrome，调用方得到 `status=needs_relogin`。
 
 注意：闲鱼后端返回的错误码是 `FAIL_SYS_TOKEN_EXOIRED`（是 EXOIRED 不是 EXPIRED，
 拼写没写错），和 `_AUTH_KEYWORDS` / `_is_recoverable_auth_error` 匹配一致。

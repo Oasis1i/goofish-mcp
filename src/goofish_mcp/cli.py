@@ -9,9 +9,10 @@ import typer
 from loguru import logger
 
 from goofish_mcp.core import GoofishError, iter_commands
-from goofish_mcp.core.errors import PartialResultError
+from goofish_mcp.core.errors import AuthRequiredError, PartialResultError
 from goofish_mcp.core.output import Format, render
 from goofish_mcp.core.registry import Command, discover
+from goofish_mcp.core.relogin import emit_relogin
 from goofish_mcp.sandbox.cli import app as sandbox_app
 
 app = typer.Typer(
@@ -59,6 +60,8 @@ def _wrap(cmd: Command):
             typer.secho(f"[{e.error.get('error_type', 'PartialResultError')}] {e}", fg=typer.colors.RED, err=True)
             raise typer.Exit(code=e.exit_code) from e
         except GoofishError as e:
+            if isinstance(e, AuthRequiredError):
+                emit_relogin(e)
             typer.secho(f"[{type(e).__name__}] {e}", fg=typer.colors.RED, err=True)
             raise typer.Exit(code=e.exit_code) from e
         except Exception as e:  # noqa: BLE001

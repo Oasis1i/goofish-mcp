@@ -23,6 +23,18 @@ class GoofishError(Exception):
 class AuthRequiredError(GoofishError):
     exit_code = 77
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        raw: dict | None = None,
+        hint: str | None = None,
+        needs_relogin: bool = False,
+    ):
+        super().__init__(message, raw=raw, hint=hint)
+        self.needs_relogin = needs_relogin
+        self.status = "needs_relogin" if needs_relogin else ""
+
 
 class SignError(GoofishError):
     exit_code = 78

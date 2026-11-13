@@ -3,7 +3,10 @@
 from typing import Any
 
 from goofish_mcp.core import Session, Strategy, command
+from goofish_mcp.core.errors import AuthRequiredError
 from goofish_mcp.core.mtop import call
+from goofish_mcp.core.refresh import is_enabled
+from goofish_mcp.core.relogin import relogin_fields
 
 
 @command(
@@ -29,12 +32,32 @@ def status() -> dict[str, Any]:
             "tracknick": session.tracknick,
             "nick": user.get("nick", ""),
             "valid": True,
+            "needs_relogin": False,
+            "status": "ok",
+            "auto_refresh": is_enabled(),
         }
+    except AuthRequiredError as exc:
+        body = {
+            "unb": session.unb,
+            "tracknick": session.tracknick,
+            "nick": "",
+            "valid": False,
+            "needs_relogin": False,
+            "status": "invalid",
+            "auto_refresh": is_enabled(),
+            "error": str(exc),
+        }
+        if exc.needs_relogin:
+            body.update(relogin_fields())
+        return body
     except Exception as e:  # noqa: BLE001
         return {
             "unb": session.unb,
             "tracknick": session.tracknick,
             "nick": "",
             "valid": False,
+            "needs_relogin": False,
+            "status": "invalid",
+            "auto_refresh": is_enabled(),
             "error": str(e),
         }
