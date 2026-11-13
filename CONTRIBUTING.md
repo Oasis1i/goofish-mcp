@@ -45,7 +45,7 @@ clawhub package publish ./openclaw-goofish-<version>.tgz \
 `.codex-plugin/plugin.json` 和 `.mcp.json`，`package.json` 不得增加 `openclaw.extensions`。
 工具过滤必须通过 `openclaw agent --local` 的 embedded-agent 会话 trajectory 验证；
 `openclaw mcp probe` 不读取 bundle 的 `.mcp.json`，不能作为 bundle E2E 证据。
-预期为 16 个业务工具可见，5 个 `toolFilter.exclude` 工具不可见；OpenClaw
+预期为 17 个业务工具可见，5 个 `toolFilter.exclude` 工具不可见；OpenClaw
 另外生成的 4 个 prompts/resources 桥接工具不计入业务工具数。
 
 单测全绿 **不等于** 功能可用。下面三种情况是硬门槛：
